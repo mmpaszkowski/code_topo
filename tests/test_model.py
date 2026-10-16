@@ -1,5 +1,5 @@
 from contextlib import closing
-from dataclasses import FrozenInstanceError, fields, replace
+from dataclasses import FrozenInstanceError, asdict, fields, replace
 import hashlib
 from pathlib import Path
 import sqlite3
@@ -91,6 +91,22 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(index.reference_kind_bit(16).name, "call")
         self.assertEqual(index.body(4).line_count, 2)
         self.assertEqual(m.validate(index), ())
+
+        rebuilt = m.IndexBuilder.from_model(index).build()
+        self.assertEqual(asdict(rebuilt.metadata), asdict(index.metadata))
+        for field in fields(m.IndexModel):
+            if field.name.startswith("_") or field.name == "metadata":
+                continue
+            originals = getattr(index, field.name)
+            copies = getattr(rebuilt, field.name)
+            self.assertEqual(len(copies), len(originals), field.name)
+            for original, copy in zip(originals, copies, strict=True):
+                with self.subTest(collection=field.name):
+                    self.assertEqual(asdict(copy), asdict(original))
+                    self.assertIsNot(copy, original)
+        self.assertIs(rebuilt.reference(1).target, rebuilt.symbol(3))
+        self.assertIs(rebuilt.symbol(4).parent, rebuilt.symbol(2))
+        self.assertEqual(m.validate(rebuilt), ())
 
     def test_forward_references_resolve_to_final_symbol(self):
         b = builder(file=True)
@@ -273,6 +289,9 @@ class ModelTests(unittest.TestCase):
         index = b.build()
         self.assertIs(index.symbol(1500).parent, index.symbol(1499))
         self.assertIn("1500", repr(index.symbol(1500)))
+        rebuilt = m.IndexBuilder.from_model(index).build()
+        self.assertIs(rebuilt.symbol(1500).parent, rebuilt.symbol(1499))
+        self.assertIsNot(rebuilt.symbol(1499), index.symbol(1499))
 
     def test_recursive_and_mutually_recursive_calls_are_valid(self):
         b = builder(file=True)
@@ -402,6 +421,157 @@ class ModelTests(unittest.TestCase):
                      for s in index.symbols],
                     [(r.target.symbol_id, r.container.symbol_id, int(r.kind)) for r in index.symbol_references])
         self.assertEqual(facts(models[0]), facts(models[1]))
+
+
+class BuilderEnrichmentTests(unittest.TestCase):
+    def test_enrichment_preserves_input_and_relinks_existing_relationships(self):
+        b = builder(file=True)
+        symbol(b, 1, signature="()")
+        b.add_scope(scope_id=2, qualified_name="owner::", owner_symbol_id=1)
+        symbol(b, 2, scope=2)
+        b.add_symbol_reference(reference_id=1, target_symbol_id=1, container_symbol_id=2,
+                               location_id=1, kind=m.ReferenceKind.CALL)
+        original = b.build()
+
+        draft = m.IndexBuilder.from_model(original)
+        draft.enrich_symbol(symbol_id=1, kind_id=1, declaration_location_id=1,
+                            definition_location_id=2, signature="()",
+                            template_specialization_args="<int>", documentation="Does work.",
+                            return_type="int")
+        # Enrichment may refer to records that are added later in the same step.
+        draft.add_symbol_kind(kind_id=1, name="function")
+        draft.add_location(location_id=2, file_id=1, start=m.Position(1, 0), end=m.Position(2, 1))
+        draft.enrich_symbol(symbol_id=1, kind_id=1, return_type="int")
+        draft.enrich_symbol(symbol_id=1, documentation=None)
+        enriched = draft.build()
+
+        self.assertIsNone(original.symbol(1).kind)
+        self.assertIsNone(original.symbol(1).documentation)
+        self.assertEqual(original.symbol(1).signature, "()")
+        self.assertEqual(enriched.symbol(1).documentation, "Does work.")
+        self.assertEqual(enriched.symbol(1).return_type, "int")
+        self.assertEqual(enriched.symbol(1).template_specialization_args, "<int>")
+        self.assertIs(enriched.symbol(1).kind, enriched.kind(1))
+        self.assertIs(enriched.symbol(1).declaration, enriched.location(1))
+        self.assertIs(enriched.symbol(1).definition, enriched.location(2))
+        self.assertIs(enriched.reference(1).target, enriched.symbol(1))
+        self.assertIs(enriched.reference(1).container, enriched.symbol(2))
+        self.assertIs(enriched.symbol(2).parent, enriched.symbol(1))
+        self.assertIs(enriched.symbol(1).definition.file, enriched.file(1))
+
+    def test_conflicts_reject_the_entire_enrichment_call(self):
+        b = builder(file=True)
+        b.add_symbol_kind(kind_id=1, name="function")
+        symbol(b, 1, return_type="int", kind_id=1, definition_location_id=1)
+        for changes in (
+            dict(signature="()", return_type="float"),
+            dict(signature="()", kind_id=2),
+            dict(signature="()", definition_location_id=2),
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(m.ModelValidationError, "conflicting value"):
+                    b.enrich_symbol(symbol_id=1, **changes)
+                unchanged = b.build().symbol(1)
+                self.assertIsNone(unchanged.signature)
+                self.assertEqual(unchanged.return_type, "int")
+                self.assertEqual(unchanged.kind.kind_id, 1)
+                self.assertEqual(unchanged.definition.location_id, 1)
+
+    def test_enrichment_requires_resolved_symbol_and_valid_ids(self):
+        b = builder()
+        b.add_symbol(symbol_id=1)
+        for key in (1, 2, True, []):
+            with self.subTest(key=key), self.assertRaises(m.ModelValidationError):
+                b.enrich_symbol(symbol_id=key, signature="()")
+        original = b.build()
+        draft = m.IndexBuilder.from_model(original)
+        draft.resolve_symbol(symbol_id=1, name="f", scope_id=1, language_id=1)
+        draft.add_symbol_kind(kind_id=1, name="function")
+        draft.enrich_symbol(symbol_id=1, kind_id=1)
+        with self.assertRaises(m.ModelValidationError):
+            draft.enrich_symbol(symbol_id=1, kind_id=True)
+        draft.enrich_symbol(symbol_id=1, signature="()")
+        self.assertEqual(draft.build().symbol(1).signature, "()")
+        self.assertEqual(original.symbol(1).resolution_state, m.ResolutionState.PLACEHOLDER)
+
+    def test_invalid_enrichment_still_fails_at_build(self):
+        for changes in (dict(signature=""), dict(definition_location_id=999)):
+            b = builder()
+            symbol(b, 1)
+            original = b.build()
+            draft = m.IndexBuilder.from_model(original)
+            draft.enrich_symbol(symbol_id=1, **changes)
+            with self.subTest(changes=changes), self.assertRaises(m.ModelValidationError):
+                draft.build()
+            self.assertIsNone(original.symbol(1).signature)
+            self.assertIsNone(original.symbol(1).definition)
+
+    def test_status_changes_preserve_partial_details_and_clear_errors_explicitly(self):
+        original = builder(file=True).build()
+        b = m.IndexBuilder.from_model(original)
+        b.update_collection_status(file_id=1, stage=m.CollectionStage.SYMBOLS,
+                                   status=m.CollectionState.PARTIAL, error="one file could not be read")
+        partial = b.build()
+        self.assertEqual(partial.collection_status(1, m.CollectionStage.SYMBOLS).error,
+                         "one file could not be read")
+        b.update_collection_status(file_id=1, stage=m.CollectionStage.SYMBOLS,
+                                   status=m.CollectionState.COMPLETE)
+        complete = b.build()
+        self.assertIsNone(complete.collection_status(1, m.CollectionStage.SYMBOLS).error)
+        self.assertEqual(complete.collection_status(1, m.CollectionStage.SYMBOLS).status,
+                         m.CollectionState.COMPLETE)
+        self.assertEqual(partial.collection_status(1, m.CollectionStage.SYMBOLS).status,
+                         m.CollectionState.PARTIAL)
+        for stage in m.CollectionStage:
+            self.assertEqual(original.collection_status(1, stage).status, m.CollectionState.NOT_REQUESTED)
+        self.assertEqual(complete.collection_status(1, m.CollectionStage.METRICS).status,
+                         m.CollectionState.NOT_REQUESTED)
+
+    def test_status_update_requires_existing_key_and_valid_outcome(self):
+        b = builder(file=True)
+        for key, stage in ((2, m.CollectionStage.SYMBOLS), (True, m.CollectionStage.SYMBOLS), (1, "symbols")):
+            with self.subTest(key=key, stage=stage), self.assertRaises(m.ModelValidationError):
+                b.update_collection_status(file_id=key, stage=stage, status=m.CollectionState.COMPLETE)
+        for state, error in ((m.CollectionState.PARTIAL, None), (m.CollectionState.FAILED, None),
+                             (m.CollectionState.COMPLETE, "old error"), ("complete", None)):
+            with self.subTest(state=state, error=error):
+                b.update_collection_status(file_id=1, stage=m.CollectionStage.SYMBOLS,
+                                           status=state, error=error)
+                with self.assertRaises(m.ModelValidationError):
+                    b.build()
+
+    def test_metadata_completion_is_explicit_and_preserves_old_snapshot(self):
+        original = builder().build()
+        b = m.IndexBuilder.from_model(original)
+        self.assertEqual(b.build().metadata.status, m.SnapshotStatus.BUILDING)
+        b.update_metadata(replace(original.metadata, status=m.SnapshotStatus.COMPLETE,
+                                  completed_at=STAMP, metrics_version="metrics-v1"))
+        complete = b.build()
+        self.assertEqual(complete.metadata.status, m.SnapshotStatus.COMPLETE)
+        self.assertEqual(complete.metadata.metrics_version, "metrics-v1")
+        self.assertEqual(complete.metadata.created_at, original.metadata.created_at)
+        self.assertEqual(original.metadata.status, m.SnapshotStatus.BUILDING)
+        with self.assertRaises(m.ModelValidationError):
+            b.set_metadata(original.metadata)
+        with self.assertRaises(m.ModelValidationError):
+            m.IndexBuilder().update_metadata(original.metadata)
+        with self.assertRaises(m.ModelValidationError):
+            b.update_metadata(None)
+
+    def test_from_model_rejects_invalid_input_and_preserves_unknowns(self):
+        with self.assertRaises(m.ModelValidationError):
+            m.IndexBuilder.from_model(None)
+        b = builder(file=True)
+        b.add_symbol(symbol_id=1)
+        b.add_scope(scope_id=2, qualified_name="unknown::")
+        b.add_symbol_reference(reference_id=1, target_symbol_id=1, location_id=1,
+                               kind=m.ReferenceKind.REFERENCE)
+        rebuilt = m.IndexBuilder.from_model(b.build()).build()
+        self.assertIsNone(rebuilt.file(1).content_hash)
+        self.assertIsNone(rebuilt.scope(2).owner)
+        self.assertIsNone(rebuilt.symbol(1).name)
+        self.assertIsNone(rebuilt.reference(1).container)
+        self.assertIs(rebuilt.reference(1).target, rebuilt.symbol(1))
 
 
 class SchemaAgreementTests(unittest.TestCase):

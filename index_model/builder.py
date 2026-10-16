@@ -1,11 +1,12 @@
 """ID-based staging followed by iterative construction of a canonical object graph."""
 
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+from typing import Self
 
 from . import records as r
 from .errors import ModelValidationError, ValidationIssue, instance, integer, require
-from .snapshot import IndexModel, _COLLECTIONS
+from .snapshot import IndexModel, _BY_TYPE, _COLLECTIONS, _key
 from .types import (
     AccessId, CollectionStage, CollectionState, DocumentationStatus, FileId,
     GLOBAL_SCOPE_ID, IncludeId, InheritanceId, KindId, LanguageId, LibraryId,
@@ -34,9 +35,34 @@ class IndexBuilder:
         self._drafts: dict[_Node, _Draft] = {}
         self.add_scope(scope_id=GLOBAL_SCOPE_ID, qualified_name="")
 
+    @classmethod
+    def from_model(cls, model: IndexModel) -> Self:
+        """Stage a snapshot's records, preserving IDs without retaining entity links."""
+        builder = cls()
+        instance(builder, "model", model, IndexModel)
+        builder.set_metadata(model.metadata)
+        for collection in _COLLECTIONS:
+            for record in getattr(model, collection):
+                values = {}
+                links = {}
+                for field in fields(record):
+                    value = getattr(record, field.name)
+                    if type(value) in _BY_TYPE:
+                        links[field.name] = (_BY_TYPE[type(value)][0], _key(value))
+                    else:
+                        values[field.name] = value
+                builder._drafts[collection, _key(record)] = _Draft(values, links)
+        return builder
+
     def set_metadata(self, metadata: r.IndexMetadata) -> None:
         instance(self, "metadata", metadata, r.IndexMetadata)
         require(self._metadata is None, self, "metadata", "already supplied")
+        self._metadata = metadata
+
+    def update_metadata(self, metadata: r.IndexMetadata) -> None:
+        """Explicitly replace existing metadata, for example to record completion."""
+        instance(self, "metadata", metadata, r.IndexMetadata)
+        require(self._metadata is not None, self, "metadata", "has not been supplied")
         self._metadata = metadata
 
     def _add(self, collection: str, key: object, values: dict[str, object],
@@ -115,6 +141,45 @@ class IndexBuilder:
                      definition_location_id, signature, template_specialization_args,
                      documentation, return_type, replace_placeholder=True)
 
+    def enrich_symbol(self, *, symbol_id: SymbolId, kind_id: KindId | None = None,
+                      declaration_location_id: LocationId | None = None,
+                      definition_location_id: LocationId | None = None,
+                      signature: str | None = None, template_specialization_args: str | None = None,
+                      documentation: str | None = None, return_type: str | None = None) -> None:
+        """Fill missing details of a resolved symbol; None leaves a field unchanged.
+
+        Repeating a known value is allowed. A conflicting value rejects the whole
+        update. Use resolve_symbol() for an unresolved placeholder.
+        """
+        integer(self, "symbol_id", symbol_id)
+        node = ("symbols", symbol_id)
+        draft = self._drafts.get(node)
+        require(draft is not None and draft.values["name"] is not None, self, "symbol_id",
+                "enrich_symbol requires an existing, resolved symbol")
+        values = dict(draft.values)
+        links = dict(draft.links)
+        for name, value in (
+            ("signature", signature), ("template_specialization_args", template_specialization_args),
+            ("documentation", documentation), ("return_type", return_type),
+        ):
+            if value is not None:
+                require(values[name] is None or values[name] == value, self, name,
+                        f"conflicting value for symbol {symbol_id}")
+                values[name] = value
+        for name, collection, target_id in (
+            ("kind", "symbol_kinds", kind_id),
+            ("declaration", "locations", declaration_location_id),
+            ("definition", "locations", definition_location_id),
+        ):
+            if target_id is not None:
+                integer(self, name, target_id)
+                target = (collection, target_id)
+                require(name not in links or links[name] == target, self, name,
+                        f"conflicting value for symbol {symbol_id}")
+                values.pop(name, None)
+                links[name] = target
+        self._drafts[node] = _Draft(values, links)
+
     def _symbol(self, symbol_id: SymbolId, name: str | None, scope_id: ScopeId | None,
                 kind_id: KindId | None, language_id: LanguageId | None,
                 declaration_location_id: LocationId | None, definition_location_id: LocationId | None,
@@ -176,6 +241,16 @@ class IndexBuilder:
         instance(self, "stage", stage, CollectionStage)
         self._add("collection_statuses", (file_id, stage), dict(stage=stage, status=status, error=error),
                   {"file": ("files", file_id)})
+
+    def update_collection_status(self, *, file_id: FileId, stage: CollectionStage,
+                                 status: CollectionState, error: str | None = None) -> None:
+        """Replace an existing stage outcome and its error; validate on build()."""
+        integer(self, "file_id", file_id)
+        instance(self, "stage", stage, CollectionStage)
+        node = ("collection_statuses", (file_id, stage))
+        require(node in self._drafts, self, "collection_status", "does not exist")
+        self._drafts[node] = _Draft(dict(stage=stage, status=status, error=error),
+                                   {"file": ("files", file_id)})
 
     def add_generated_documentation(self, *, symbol_id: SymbolId, comment: str | None = None,
                                     status: DocumentationStatus = DocumentationStatus.PENDING,

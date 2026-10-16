@@ -1,0 +1,11 @@
+# Relative paths are resolved from this file's directory.
+project_root: ../monogon
+
+database:
+  path: index.sqlite3
+  save_after_each_step: true
+
+steps:
+  - type: clangd_yaml
+    path: monogon-index.yaml
+    recover_known_errors: true

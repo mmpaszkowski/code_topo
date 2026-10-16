@@ -1,0 +1,2 @@
+# The clangd YAML adapter and the configurable CLI use this dependency.
+PyYAML>=6.0,<7

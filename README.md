@@ -8,6 +8,138 @@ The [Python model](index_model/README.md) represents the complete schema as an
 immutable graph with nested relationships, typed builder methods, and validation.
 It uses only the Python 3.11+ standard library and performs no database access.
 
+## Run the pipeline
+
+Install the YAML dependency, then run the CLI from this directory:
+
+```sh
+python3 -m pip install -r requirements-clangd.txt
+python3 run_pipeline.py
+python3 run_pipeline.py --config path/to/config.yaml
+```
+
+The default is `config.yaml` in the current working directory. The included
+configuration imports the local `monogon-index.yaml` export:
+
+```yaml
+project_root: ../monogon
+
+database:
+  path: index.sqlite3
+  save_after_each_step: true
+
+steps:
+  - type: clangd_yaml
+    path: monogon-index.yaml
+    recover_known_errors: true
+```
+
+Edit the paths for your project. Paths inside the configuration are relative to
+its directory, regardless of where the command is launched. Absolute paths also
+work. The export must already exist; the CLI does not run clangd-indexer.
+
+Steps run in list order. Currently `clangd_yaml` is the only supported step and
+must appear once, first, because it requires an empty initial model.
+`recover_known_errors` defaults to `true`; setting it to `false` disables the
+importer's narrow recovery of malformed symbol kinds. The `database` section is
+optional. Unknown settings, duplicate keys, incorrect types, and empty
+step lists are configuration errors and are rejected before execution.
+
+The CLI prints model counts, snapshot status, and diagnostic counts to stdout.
+Progress, database saves, and detailed diagnostics go to stderr. The model's status
+remains `building`; saving it does not mark it ready for publication. Current
+source files are assumed to match the export, as described in
+the [importer documentation](clangd_import/README.md). Recoverable diagnostics
+allow success with partial coverage. Exit codes are `0` for success, `1` for an
+execution failure, and `2` for a configuration or argument error. A failed step
+stops execution and logs its traceback.
+
+[`pipeline_config.py`](pipeline_config.py) loads immutable settings.
+[`application_factory.py`](application_factory.py) constructs concrete steps and
+storage. [`Application`](application.py) receives those objects through its
+constructor and runs them; it has no dependency on clangd, YAML, or SQLite.
+[`run_pipeline.py`](run_pipeline.py) handles arguments and displays results using
+the common `Step` interface.
+
+To support another step, add its settings and validation to the loader and its
+construction to `create_step()`. Implement `run(model)` and optionally override
+`summary()` to return immutable `SummaryItem(label, value)` records. The default
+summary is empty. Each adapter owns its summary values and diagnostic logging;
+the CLI does not inspect tool-specific reports or branch on concrete step types.
+The model, application, and pipeline need no YAML dependency.
+
+## Save after each step
+
+`database.save_after_each_step: true` saves the resulting model after every
+successful step and before the next step starts. `database.path` is required
+when the section is present and is relative to the configuration file. Its
+parent directory must already exist. Omitting the section or setting
+`save_after_each_step: false` leaves execution entirely in memory; the boolean
+defaults to `false`. The supplied configuration enables saving to `index.sqlite3`.
+
+Each save replaces the complete model in one SQLite transaction. IDs, unknown
+values, metadata, and partial collection statuses are preserved. The existing
+database remains unchanged if writing, validation, or commit fails, and the
+pipeline stops with exit code `1`. A missing database is created exclusively on
+the first save; a failed initial save removes only that newly created output.
+
+Existing databases must match the bundled `schema.sql` definitions (including
+tables, views, and indexes), schema version, and project metadata. Compatibility
+is checked before steps run and again under the write lock. Unrelated databases
+and modified schemas are rejected without migration. The writer validates model
+structure, enables foreign keys, and checks SQLite integrity before committing.
+
+The small [`ModelStore`](model_store.py) interface exposes `save(model)`;
+[`SQLiteModelStore`](sqlite_model_store.py) implements it using standard-library
+`sqlite3` and explicit column mappings. The application factory creates the store
+and checks its destination; `Application` passes the injected store to
+`Pipeline(steps, store=store)`. Steps do not perform persistence themselves.
+Without a store, `Pipeline` behaves as before. An empty pipeline does not save.
+
+The database contains the latest saved model, including metrics and generated
+documentation when present. Importer-specific diagnostics and external ID maps
+remain in the import report. Database loading, resume, incremental writes, and
+concurrent pipeline writers are not implemented. Intermediate databases may fail
+the publication validator because their status is `building` or coverage is partial.
+
+## Sequential enrichment
+
+[`index_pipeline.py`](index_pipeline.py) provides a `Step` abstract base class
+with `run(model: IndexModel) -> IndexModel` and a `Pipeline` that executes steps
+in the supplied order. Each step receives its tools and configuration through
+its constructor, reads the previous snapshot, and returns a validated snapshot
+using `IndexBuilder.from_model(model)` and `build()`.
+
+```python
+from index_pipeline import Pipeline
+
+model = Pipeline([collect_symbols, collect_source_ranges, calculate_metrics]).run(initial_model)
+```
+
+The variables above are application-supplied step instances. A runnable example
+with two injected fixture tools is available without external dependencies:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m examples.sequential_steps
+```
+
+The pipeline logs step start, completion, and failure through the standard
+`logging` module under `index_pipeline`; the application configures logging.
+Step and storage exceptions propagate unchanged and prevent later steps from running. Earlier
+snapshots remain unchanged; tool side effects are not rolled back. Steps check
+their own prerequisites and explicitly report partial coverage when they can
+continue. A wrong return type is an error. An empty pipeline returns its input.
+
+Each returned snapshot must satisfy the model's structural rules, including
+explicit coverage for all files. Steps retain snapshot-local IDs and normalize
+tool-specific identities and coordinates at their boundary. Successful execution
+does not automatically change metadata status or establish publication readiness.
+
+The first real step is the [clangd YAML importer](clangd_import/README.md). It reads
+an existing export, creates an immutable model, and exposes a separate import report
+with external ID mappings and diagnostics. Its PyYAML dependency is listed in
+`requirements-clangd.txt`.
+
 ## Normalization contract
 
 Stored relations are designed for 3NF under the following dependencies. Read-only
@@ -165,8 +297,10 @@ Build a fresh database beside the current snapshot:
    validation. For a single-file replacement, checkpoint and close any WAL-mode
    database first. A failed candidate must leave the current snapshot intact.
 
-The validator is read-only and never creates a missing database. The repository
-provides the schema and validation, not an importer or snapshot publisher.
+The validator is read-only and never creates a missing database. The configurable
+CLI can save intermediate models to SQLite, but snapshot publication remains a
+separate application responsibility. Use a separate working database if you need
+to retain a previously published complete snapshot while building a new one.
 
 `libraries` represents logical ownership; one file has at most one owner.
 Build-target membership is deferred. Includes are resolved graph edges, not a
@@ -188,8 +322,12 @@ generated rows; cross-snapshot identity and result reuse are deferred.
 
 ## Tests
 
-Run the dependency-free schema and validator tests with:
+After installing the optional YAML adapter dependency, run all tests with:
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -W error::ResourceWarning -m unittest discover -s tests -v
 ```
+
+The schema/model/pipeline/storage tests themselves need only the standard library. See the
+[adapter verification instructions](clangd_import/README.md#verification) for the
+optional full Monogon import and SQLite persistence check.

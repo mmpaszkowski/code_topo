@@ -1,6 +1,7 @@
 """Read a small YAML configuration into immutable application settings."""
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 
 import yaml
@@ -18,6 +19,18 @@ class ClangdYamlStepConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ClangdLspStepConfig:
+    compile_commands_dir: Path
+    executable: str = "clangd"
+    timeout_seconds: float = 60
+    remove_compile_flags: tuple[str, ...] = ()
+    exclude_paths: tuple[str, ...] = ()
+
+
+StepConfig = ClangdYamlStepConfig | ClangdLspStepConfig
+
+
+@dataclass(frozen=True, slots=True)
 class DatabaseConfig:
     path: Path
     save_after_each_step: bool = False
@@ -26,7 +39,7 @@ class DatabaseConfig:
 @dataclass(frozen=True, slots=True)
 class PipelineConfig:
     project_root: Path
-    steps: tuple[ClangdYamlStepConfig, ...]
+    steps: tuple[StepConfig, ...]
     database: DatabaseConfig | None = None
 
 
@@ -68,6 +81,15 @@ def _path(value: object, field: str, directory: Path) -> Path:
     return (directory / text).resolve()
 
 
+def _strings(value: object, field: str) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise ConfigurationError(f"{field}: expected a list of strings")
+    result = tuple(_text(item, field) for item in value)
+    if any("\0" in item for item in result):
+        raise ConfigurationError(f"{field}: cannot contain a null character")
+    return result
+
+
 def load_config(path: Path) -> PipelineConfig:
     """Validate the whole configuration before creating or running any steps."""
     path = Path(path).absolute()
@@ -91,10 +113,36 @@ def load_config(path: Path) -> PipelineConfig:
         steps = []
         for index, raw_step in enumerate(raw_steps):
             field = f"steps[{index}]"
-            step = _settings(raw_step, {"type", "path", "recover_known_errors"}, field)
+            step = _settings(raw_step, {"type", "path", "recover_known_errors",
+                                        "compile_commands_dir", "executable", "timeout_seconds",
+                                        "remove_compile_flags", "exclude_paths"}, field)
             step_type = _text(step.get("type"), f"{field}.type")
+            if step_type == "clangd_lsp":
+                _settings(step, {"type", "compile_commands_dir", "executable", "timeout_seconds",
+                                 "remove_compile_flags", "exclude_paths"}, field)
+                if index != 1:
+                    raise ConfigurationError(f"{field}: clangd_lsp must follow clangd_yaml and cannot be repeated")
+                directory = _path(step.get("compile_commands_dir"), f"{field}.compile_commands_dir", path.parent)
+                executable = _text(step.get("executable", "clangd"), f"{field}.executable")
+                if "\0" in executable:
+                    raise ConfigurationError(f"{field}.executable: cannot contain a null character")
+                if "/" in executable:
+                    executable = str(_path(executable, f"{field}.executable", path.parent))
+                timeout = step.get("timeout_seconds", 60)
+                if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                        or not math.isfinite(timeout) or timeout <= 0):
+                    raise ConfigurationError(f"{field}.timeout_seconds: expected a positive finite number")
+                remove = _strings(step.get("remove_compile_flags", []), f"{field}.remove_compile_flags")
+                if any(not flag.startswith("-") or any(char.isspace() for char in flag) for flag in remove):
+                    raise ConfigurationError(f"{field}.remove_compile_flags: expected standalone flag tokens")
+                exclude = _strings(step.get("exclude_paths", []), f"{field}.exclude_paths")
+                if any(Path(pattern).is_absolute() for pattern in exclude):
+                    raise ConfigurationError(f"{field}.exclude_paths: expected project-relative patterns")
+                steps.append(ClangdLspStepConfig(directory, executable, timeout, remove, exclude))
+                continue
             if step_type != "clangd_yaml":
                 raise ConfigurationError(f"{field}.type: unknown step type: {step_type}")
+            _settings(step, {"type", "path", "recover_known_errors"}, field)
             if index != 0:
                 raise ConfigurationError(f"{field}: clangd_yaml must be first and cannot be repeated")
             export_path = _path(step.get("path"), f"{field}.path", path.parent)

@@ -9,3 +9,10 @@ steps:
   - type: clangd_yaml
     path: monogon-index.yaml
     recover_known_errors: true
+
+  - type: clangd_lsp
+    compile_commands_dir: ../monogon/build
+    remove_compile_flags:
+      - -fprofile-abs-path
+    exclude_paths:
+      - build/_deps/*

@@ -32,14 +32,30 @@ steps:
   - type: clangd_yaml
     path: monogon-index.yaml
     recover_known_errors: true
+
+  - type: clangd_lsp
+    compile_commands_dir: ../monogon/build
+    remove_compile_flags:
+      - -fprofile-abs-path
+    exclude_paths:
+      - build/_deps/*
 ```
 
 Edit the paths for your project. Paths inside the configuration are relative to
 its directory, regardless of where the command is launched. Absolute paths also
 work. The export must already exist; the CLI does not run clangd-indexer.
 
-Steps run in list order. Currently `clangd_yaml` is the only supported step and
-must appear once, first, because it requires an empty initial model.
+Steps run in list order. `clangd_yaml` must appear once, first, because it requires
+an empty initial model. The optional `clangd_lsp` step follows it once and adds
+full declaration/definition ranges and resolved include dependencies. It needs
+clangd on `PATH` and an existing `compile_commands.json` in the configured directory.
+It inspects existing project files and matches existing symbols by exact locations;
+it does not repeat symbol discovery or collect calls. See the
+[LSP adapter documentation](clangd_lsp/README.md) for configuration and coverage.
+The supplied configuration removes the unsupported coverage flag from a temporary
+compilation-database copy and excludes vendored files from LSP inspection. Both
+settings default to empty lists in other configurations. Existing build inputs
+and imported dependency symbols are preserved.
 `recover_known_errors` defaults to `true`; setting it to `false` disables the
 importer's narrow recovery of malformed symbol kinds. The `database` section is
 optional. Unknown settings, duplicate keys, incorrect types, and empty
@@ -67,6 +83,10 @@ construction to `create_step()`. Implement `run(model)` and optionally override
 summary is empty. Each adapter owns its summary values and diagnostic logging;
 the CLI does not inspect tool-specific reports or branch on concrete step types.
 The model, application, and pipeline need no YAML dependency.
+
+The new LSP adapter has no dependency on the YAML adapter or its report. The
+application factory constructs its client and step; all LSP communication and
+interpretation remain inside `clangd_lsp`.
 
 ## Save after each step
 

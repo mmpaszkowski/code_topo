@@ -124,6 +124,50 @@ steps:
             with self.subTest(text=text), self.assertRaises(ConfigurationError):
                 self.load(text)
 
+    def test_lsp_settings_and_defaults(self):
+        text = VALID_CONFIG + "  - type: clangd_lsp\n    compile_commands_dir: ../build\n"
+        config = self.load(text)
+        lsp = config.steps[1]
+        self.assertEqual(lsp.compile_commands_dir, self.directory.parent / "build")
+        self.assertEqual(lsp.executable, "clangd")
+        self.assertEqual(lsp.timeout_seconds, 60)
+        self.assertEqual(lsp.remove_compile_flags, ())
+        self.assertEqual(lsp.exclude_paths, ())
+        with self.assertRaises(FrozenInstanceError):
+            lsp.executable = "changed"
+        lsp = self.load(text + "    executable: ./bin/clangd\n    timeout_seconds: 1.5\n").steps[1]
+        self.assertEqual(lsp.executable, str(self.directory / "bin" / "clangd"))
+        self.assertEqual(lsp.timeout_seconds, 1.5)
+        lsp = self.load(text + "    remove_compile_flags: [-fprofile-abs-path]\n"
+                        "    exclude_paths: ['build/_deps/*']\n").steps[1]
+        self.assertEqual(lsp.remove_compile_flags, ("-fprofile-abs-path",))
+        self.assertEqual(lsp.exclude_paths, ("build/_deps/*",))
+
+    def test_invalid_lsp_settings_and_order(self):
+        lsp = "  - type: clangd_lsp\n    compile_commands_dir: build\n"
+        cases = [
+            ("project_root: .\nsteps:\n" + lsp, "must follow clangd_yaml"),
+            (VALID_CONFIG + lsp + lsp, "cannot be repeated"),
+            (VALID_CONFIG + "  - type: clangd_lsp\n", "compile_commands_dir"),
+            (VALID_CONFIG + lsp + "    path: input.yaml\n", "unknown settings"),
+            (VALID_CONFIG + "    compile_commands_dir: build\n", "unknown settings"),
+        ]
+        for timeout in ("true", "0", "-1", "'5'", ".inf", ".nan", "null"):
+            cases.append((VALID_CONFIG + lsp + f"    timeout_seconds: {timeout}\n", "timeout_seconds"))
+        for executable in ("null", "42", "''", '"bad\\0exe"'):
+            cases.append((VALID_CONFIG + lsp + f"    executable: {executable}\n", "executable"))
+        for setting in ("remove_compile_flags", "exclude_paths"):
+            for value in ("null", "true", "'text'", "[42]", "['']", '["bad\\0value"]'):
+                cases.append((VALID_CONFIG + lsp + f"    {setting}: {value}\n", setting))
+        for setting, value in (("exclude_paths", "['/absolute/*']"),
+                               ("remove_compile_flags", "['value']"),
+                               ("remove_compile_flags", "['-I path']")):
+            cases.append((VALID_CONFIG + lsp + f"    {setting}: {value}\n", setting))
+        for text, expected in cases:
+            with self.subTest(text=text), self.assertRaises(ConfigurationError) as caught:
+                self.load(text)
+            self.assertIn(expected, str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

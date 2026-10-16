@@ -1,0 +1,195 @@
+# Code index database
+
+`schema.sql` defines a SQLite schema for one project/build snapshot. SQLite 3.37
+or later is required for `STRICT` tables. Schema version 3 is a rebuild-only
+change; earlier databases, including version 2, must be rebuilt.
+
+The [Python model](index_model/README.md) represents the complete schema as an
+immutable graph with nested relationships, typed builder methods, and validation.
+It uses only the Python 3.11+ standard library and performs no database access.
+
+## Normalization contract
+
+Stored relations are designed for 3NF under the following dependencies. Read-only
+views expose derived fields without introducing additional stored copies.
+
+| Relation | Determinants and dependent facts |
+| --- | --- |
+| Lookup tables | ID and unique name are alternative keys. |
+| `files` | File ID or URI determines ownership and indexed content hash. |
+| `locations` | Location ID or the full file/range tuple determines the location. |
+| `scopes` | Scope ID determines its display name and optional owner; a known owner uniquely identifies its scope. Display names are not keys. |
+| `symbols` | Symbol ID determines its attributes and containing scope ID. |
+| `symbol_bodies` | Symbol ID determines the selected body and analysis metrics. Physical line count is derived from its location. |
+| `collection_status` | `(file_id, stage)` determines status and error. |
+| `symbol_source_ranges` | `(symbol_id, location_id, role)` is the complete key. |
+| Relationship tables | An edge ID or its unique endpoint pair identifies the edge and any attributes. |
+| `symbol_references` | Reference ID or the normalized target/location/flags/container tuple identifies an observation. |
+| `generated_documentation` | Symbol ID determines the current generation result and provenance. |
+| `index_metadata` | One row describes the snapshot. |
+
+Scope membership and semantic parentage are stored only once: a symbol references
+a scope, which optionally references its owning symbol. `symbol_details` derives
+`scope`, `parent_symbol_id`, and `resolution_state`. `symbol_body_metrics` derives
+`line_count`. Neither view is writable.
+
+The reference bitmask remains an application-owned scalar flag value; it does not
+introduce a non-key functional dependency. No dependency from an occurrence's
+location to a single target or container is assumed, because source expansion
+and semantic contexts can overlap. Likewise, other body metrics belong to the
+analyzed symbol: template instantiation or compilation context can produce
+different analysis results for a shared source range. Only physical line count
+is determined solely by that range.
+
+## Import boundary
+
+The database stores application concepts, independently of the indexing tool.
+The importer owns external IDs, raw records, enum mappings, and coordinate
+conversion. It maintains an in-memory mapping from external identity to integer
+`symbol_id`. IDs are local to a snapshot: do not use them as cross-build bookmarks
+or match symbols by name/signature. Each producer needs an explicit mapping to
+the application's kind and language names (for example `function` and `C++`).
+
+When a reference arrives before its symbol, insert a placeholder and reuse its
+ID when resolving it. A placeholder has no symbol attributes. Resolve it by
+setting `name`, `scope_id`, and `language_id` together. Source locations may remain
+unknown. `symbol_details.resolution_state` is derived from the presence of those
+attributes, so it cannot contradict them. Remaining placeholders are allowed in
+a published snapshot, and consumers must display them as unresolved.
+
+The schema creates the global scope with `scope_id = 1`, an empty display name,
+and no owner. A resolved symbol in global scope references that row. NULL
+`symbols.scope_id` is reserved for placeholders; it never means global scope.
+For a known non-global scope, insert a `scopes` row with a nonempty qualified
+display name (for example `ns::Widget::`) and an optional `owner_symbol_id`.
+The owner is the semantic containing symbol, not a lexical source container.
+Use NULL when the owner is unknown; filling it later resolves parentage for all
+members without updating those symbols. Self-ownership and longer cycles are
+rejected by snapshot validation.
+
+An owner introduces at most one scope. Distinct scopes may share a display name,
+including anonymous namespaces in different files or scopes under overloaded
+functions. The importer maps scope identities just as it maps symbol identities;
+do not merge scopes solely by display name. Insert an owner's symbol or placeholder
+before linking it from a scope. For nested scopes, create the enclosing scope,
+its member/owner symbol, and then the scope that symbol introduces.
+
+Consumers that need the previous display fields can query the view:
+
+```sql
+SELECT symbol_id, name, scope, parent_symbol_id, resolution_state
+FROM symbol_details;
+```
+
+The application owns these reference flags; map source meanings explicitly:
+
+| Bit | Meaning |
+| --- | --- |
+| 1 | Declaration occurrence |
+| 2 | Definition occurrence |
+| 4 | Reference/use occurrence |
+| 8 | The symbol name is spelled at the occurrence |
+| 16 | Call occurrence |
+
+Flags may be combined. Exact duplicates are prohibited, including occurrences
+without a container. Importers should deduplicate normalized observations, using
+`ON CONFLICT DO NOTHING` for repeated inserts. Different flag sets remain distinct
+records: this schema does not automatically merge their meaning. Do not count
+records as unique source sites without grouping by their locations. A call is
+selected with `(kind & 16) <> 0`; a call container may equal its target (recursion).
+Observed calls do not guarantee complete runtime dispatch information.
+
+## Source evidence
+
+All locations use zero-based lines, **UTF-8 byte columns**, and exclusive ends.
+The importer converts source coordinates against the exact indexed bytes before
+inserting a location. For example, in `é😀foo()`, `foo` occupies byte columns
+6 through 9, although its UTF-16 start column is 3. Line breaks are counted by LF;
+CR in CRLF remains a byte on the preceding line. Tabs are bytes, not visual stops.
+Never relabel UTF-16 offsets as byte offsets. If required bytes are unavailable,
+omit the unavailable location and record partial collection rather than guessing.
+
+`symbols.declaration_location_id` and `definition_location_id` identify preferred
+name locations for navigation. Additional name occurrences belong in
+`symbol_references`. `symbol_source_ranges` stores complete declaration,
+definition, and body extents, including multiple observed declarations. Body
+availability does not require metrics. A `symbol_bodies` row selects one body
+and must have a corresponding `body` source range.
+
+Store only analyzed metrics in `symbol_bodies`; read physical `line_count` from
+`symbol_body_metrics`. A range ending at column zero excludes that final line.
+An empty range yields zero lines and is rejected as a body by snapshot validation.
+For the usual brace-to-brace range, line count is `end_line - start_line + 1`.
+Symbols sharing a body range therefore always expose the same physical line count.
+
+`files.content_hash` is the lowercase SHA-256 digest of the indexed file bytes.
+Use NULL when the source was unavailable. Before extracting source for display
+or documentation, compare the current file hash; refuse stale or unverifiable
+source rather than presenting it as the indexed version. The structural validator
+does not read source files or perform these hash comparisons.
+
+`index_metadata` has exactly one row, with `metadata_id = 1`. Store an absolute
+project root and, when available, source revision and a SHA-256 fingerprint of
+the normalized build inputs. Build inputs include compilation commands and
+relevant configuration; record NULL when unavailable. The importer must document
+its deterministic serialization of these inputs. Timestamps use UTC ISO 8601.
+
+If metrics are present, set `metrics_version` to the application-owned algorithm
+version. That version must document treatment of lambdas, macros, implicit
+statements, and templates in addition to the counting rules in the schema.
+
+## Coverage and publication
+
+Each file needs a `collection_status` row for every stage: `symbols`, `references`,
+`includes`, `source_ranges`, and `metrics`. Use `not_requested` explicitly when
+a stage was skipped. `complete` means the configured collection finished; it
+does not establish exhaustive semantic coverage. `partial` and `failed` require
+error details. A discovered external file may have all stages `not_requested`.
+An empty reference result is meaningful only together with collection coverage;
+it must not automatically establish that a function has no dependencies.
+
+Build a fresh database beside the current snapshot:
+
+1. Execute `schema.sql` and insert metadata with status `building`.
+2. Enable `PRAGMA foreign_keys = ON` on **every writer connection**, before any
+   transaction. Insert normalized records and collection statuses transactionally.
+3. After all requested stages finish, set metadata status to `complete`, set
+   `completed_at`, commit, and close writers. A failed build keeps status `failed`
+   with an error. Do not silently change a failed stage to `not_requested`.
+4. Run `python3 validate_snapshot.py path/to/candidate.sqlite3`. Exit status 0
+   means structural checks and declared collection statuses passed. Missing
+   metadata/status rows, partial/failed stages, parent cycles, foreign-key errors,
+   missing metric body ranges, empty body ranges, a missing global scope, and
+   unsupported schema versions block publication.
+5. Only the publishing application replaces the current snapshot after successful
+   validation. For a single-file replacement, checkpoint and close any WAL-mode
+   database first. A failed candidate must leave the current snapshot intact.
+
+The validator is read-only and never creates a missing database. The repository
+provides the schema and validation, not an importer or snapshot publisher.
+
+`libraries` represents logical ownership; one file has at most one owner.
+Build-target membership is deferred. Includes are resolved graph edges, not a
+complete record of directives or conditional preprocessing.
+
+## Generated documentation
+
+Keep source comments in `symbols.documentation`. `generated_documentation`
+stores one current result per symbol with `pending`, `running`, `complete`,
+`failed`, or `stale` status. Completed results require a comment, model identifier,
+prompt version, source-input and dependency-context SHA-256 hashes, and completion
+timestamp. Hash the exact inputs given to generation, including an empty dependency
+context; do not use NULL to mean an empty context. Failed results require an error.
+
+Generation and source-hash verification belong to the application. It must mark
+results stale when their inputs change. Pending, failed, or stale documentation
+does not prevent publication of a valid code index. Full rebuilds start without
+generated rows; cross-snapshot identity and result reuse are deferred.
+
+## Tests
+
+Run the dependency-free schema and validator tests with:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -W error::ResourceWarning -m unittest discover -s tests -v
+```

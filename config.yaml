@@ -16,3 +16,12 @@ steps:
       - -fprofile-abs-path
     exclude_paths:
       - build/_deps/*
+
+  - type: clang_ast
+    compile_commands_dir: ../monogon/build
+    executable: ./build/clang_ast/indexer-clang-ast
+    timeout_seconds: 120
+    remove_compile_flags:
+      - -fprofile-abs-path
+    exclude_paths:
+      - build/_deps/*

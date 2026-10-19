@@ -7,6 +7,7 @@ import logging
 
 from index_model import IndexModel
 from model_store import ModelStore
+from progress import NO_PROGRESS, ProgressReporter
 
 
 logger = logging.getLogger(__name__)
@@ -37,9 +38,11 @@ class Step(ABC):
 
 
 class Pipeline:
-    def __init__(self, steps: Sequence[Step], *, store: ModelStore | None = None) -> None:
+    def __init__(self, steps: Sequence[Step], *, store: ModelStore | None = None,
+                 progress: ProgressReporter = NO_PROGRESS) -> None:
         self._steps = tuple(steps)
         self._store = store
+        self._progress = progress
 
     def run(self, model: IndexModel) -> IndexModel:
         """Run and optionally save each result before starting the next step."""
@@ -47,16 +50,22 @@ class Pipeline:
             raise TypeError("Pipeline.run requires an IndexModel")
         for number, step in enumerate(self._steps, 1):
             name = type(step).__name__
-            logger.info("Starting step %d/%d: %s", number, len(self._steps), name)
+            self._progress.start_step(number, len(self._steps), name)
+            if not self._progress.enabled:
+                logger.info("Starting step %d/%d: %s", number, len(self._steps), name)
+            self._progress.phase("running")
             try:
                 result = step.run(model)
                 if not isinstance(result, IndexModel):
                     raise TypeError(f"{name}.run must return an IndexModel")
                 if self._store is not None:
                     self._store.save(result)
-            except Exception:
+            except BaseException:
+                self._progress.fail_step()
                 logger.exception("Failed step %d/%d: %s", number, len(self._steps), name)
                 raise
             model = result
-            logger.info("Completed step %d/%d: %s", number, len(self._steps), name)
+            self._progress.finish_step()
+            if not self._progress.enabled:
+                logger.info("Completed step %d/%d: %s", number, len(self._steps), name)
         return model

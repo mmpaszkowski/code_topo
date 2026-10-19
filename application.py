@@ -6,13 +6,15 @@ from pathlib import Path
 from index_model import IndexBuilder, IndexMetadata, IndexModel
 from index_pipeline import Pipeline, Step
 from model_store import ModelStore
+from progress import NO_PROGRESS, ProgressReporter
 
 
 class Application:
-    def __init__(self, project_root: Path, steps: Sequence[Step], *, store: ModelStore | None = None) -> None:
+    def __init__(self, project_root: Path, steps: Sequence[Step], *, store: ModelStore | None = None,
+                 progress: ProgressReporter = NO_PROGRESS) -> None:
         self._project_root = project_root
         self._steps = tuple(steps)
-        self._pipeline = Pipeline(self._steps, store=store)
+        self._pipeline = Pipeline(self._steps, store=store, progress=progress)
 
     @property
     def steps(self) -> tuple[Step, ...]:

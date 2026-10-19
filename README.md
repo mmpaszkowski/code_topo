@@ -18,6 +18,39 @@ python3 run_pipeline.py
 python3 run_pipeline.py --config path/to/config.yaml
 ```
 
+### Progress and time estimates
+
+The CLI writes plain progress lines to stderr, including phase transitions and
+a heartbeat every five seconds while a phase is active:
+
+```text
+[4/5] ClangAstStep | compiling | 8/14 contexts | elapsed 18s | remaining ~14s | tests/layer.cpp
+[4/5] ClangAstStep | merging and validating | elapsed 7s | remaining unknown
+```
+
+Use `--progress-interval 2` to change the interval or `--no-progress` to disable
+phase reporting and its heartbeat thread. Lifecycle logs, warnings, errors, and
+the final stdout summary remain available. Intervals must be finite and positive.
+
+YAML progress counts imported bytes without a preliminary parsing pass. LSP counts
+selected project files; AST counts selected compilation contexts. Handled failures
+and skipped items count as processed, with their diagnostic outcomes reported
+separately. A finished counter does not establish semantic completeness.
+
+Elapsed time is for the current phase. Its approximate ETA uses the average rate
+after at least three completion updates and five seconds of work. Estimates reset
+on phase changes; an expired estimate becomes unknown until work advances again.
+Setup, merging, validation, shutdown, and database operations show elapsed time
+without an ETA. Step completion includes database commit time. No timing history
+is stored and no whole-pipeline estimate is calculated.
+
+Library callers retain no-op reporting by default. To enable it, construct a
+`LoggingProgressReporter` from `progress.py`, use it as a context manager, and pass
+it as `progress=` to `create_application()`. The reporter thread only reads its
+own synchronized state; indexing and database access stay on the calling thread.
+
+### Configuration
+
 The default is `config.yaml` in the current working directory. The included
 configuration imports the local `monogon-index.yaml` export:
 
@@ -47,10 +80,15 @@ work. The export must already exist; the CLI does not run clangd-indexer.
 
 Steps run in list order. `clangd_yaml` must appear once, first, because it requires
 an empty initial model. The optional `clangd_lsp` step follows it once and adds
-full declaration/definition ranges and resolved include dependencies. It needs
+declaration/definition locations and ranges, include dependencies, references,
+verified reference containers, and direct inheritance. It needs
 clangd on `PATH` and an existing `compile_commands.json` in the configured directory.
-It inspects existing project files and matches existing symbols by exact locations;
-it does not repeat symbol discovery or collect calls. See the
+It inspects existing project files and matches existing symbols by exact locations,
+using imported clangd identities to resolve ambiguous matches when possible;
+it does not repeat symbol discovery or extract ASTs. The factory provides the
+current export as clangd's static project index. Call-hierarchy results enrich
+reference containers; they do not set call flags because clangd also reports
+non-call uses such as address-taking. See the
 [LSP adapter documentation](clangd_lsp/README.md) for configuration and coverage.
 The supplied configuration removes the unsupported coverage flag from a temporary
 compilation-database copy and excludes vendored files from LSP inspection. Both
@@ -351,3 +389,32 @@ PYTHONDONTWRITEBYTECODE=1 python3 -W error::ResourceWarning -m unittest discover
 The schema/model/pipeline/storage tests themselves need only the standard library. See the
 [adapter verification instructions](clangd_import/README.md#verification) for the
 optional full Monogon import and SQLite persistence check.
+
+### AST enrichment
+
+The optional `clang_ast` step uses a small LLVM 21 LibTooling executable and a
+Python adapter to add verified callable body ranges, versioned metrics, and
+explicit statically resolved calls. It runs after YAML import and optional LSP
+enrichment, retaining compiler data in the adapter and preserving the domain
+model/schema. See [build instructions and semantics](clang_ast/README.md) and
+[the separate-database example](examples/ast.yaml).
+
+
+### Snapshot lifecycle and provenance
+
+The configured application wraps collectors with `PrepareSnapshotStep` and
+`FinalizeSnapshotStep`. Preparation populates the five reference-kind bits and
+three access specifiers, records an available Git revision (with a dirty marker),
+and fingerprints the YAML digest, effective compile commands/response files,
+relevant configuration, and tool versions. Finalization verifies those inputs
+again and sets `complete` plus the completion time after every collector returns.
+Partial/failed collection outcomes remain explicit and are printed separately;
+`complete` means a finished configured run, not exhaustive semantic knowledge.
+Preparation alone is not checkpointed, so an import failure cannot replace an
+existing index with an empty seed. A later thrown step leaves the last successful
+collector checkpoint with `building` status.
+
+AST protocol 2 additionally fills verified scope ownership, declaration details,
+inheritance attributes, and override edges, resolving existing placeholders only
+for observed declarations and necessary endpoints. No domain records, schema
+fields, or generic pipeline semantics were added for compiler state.

@@ -42,3 +42,10 @@ class SourceText:
         if end < start:
             raise ValueError("LSP range ends before it starts")
         return start, end
+
+    def lsp_position(self, value: Position, encoding: str) -> LspPosition:
+        # Validate the byte endpoint, including multi-byte character boundaries.
+        self.position(LspPosition(value.line, value.column), "utf-8")
+        prefix = self._lines[value.line].encode("utf-8")[:value.column].decode("utf-8")
+        column = len(prefix.encode("utf-16-le")) // 2 if encoding == "utf-16" else value.column
+        return LspPosition(value.line, column)

@@ -27,7 +27,16 @@ class ClangdLspStepConfig:
     exclude_paths: tuple[str, ...] = ()
 
 
-StepConfig = ClangdYamlStepConfig | ClangdLspStepConfig
+@dataclass(frozen=True, slots=True)
+class ClangAstStepConfig:
+    compile_commands_dir: Path
+    executable: str = "indexer-clang-ast"
+    timeout_seconds: float = 120
+    remove_compile_flags: tuple[str, ...] = ()
+    exclude_paths: tuple[str, ...] = ()
+
+
+StepConfig = ClangdYamlStepConfig | ClangdLspStepConfig | ClangAstStepConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,18 +126,21 @@ def load_config(path: Path) -> PipelineConfig:
                                         "compile_commands_dir", "executable", "timeout_seconds",
                                         "remove_compile_flags", "exclude_paths"}, field)
             step_type = _text(step.get("type"), f"{field}.type")
-            if step_type == "clangd_lsp":
+            if step_type in ("clangd_lsp", "clang_ast"):
                 _settings(step, {"type", "compile_commands_dir", "executable", "timeout_seconds",
                                  "remove_compile_flags", "exclude_paths"}, field)
-                if index != 1:
+                if step_type == "clangd_lsp" and index != 1:
                     raise ConfigurationError(f"{field}: clangd_lsp must follow clangd_yaml and cannot be repeated")
+                if step_type == "clang_ast" and (not steps or
+                        any(isinstance(s, ClangAstStepConfig) for s in steps)):
+                    raise ConfigurationError(f"{field}: clang_ast must follow clangd_yaml and cannot be repeated")
                 directory = _path(step.get("compile_commands_dir"), f"{field}.compile_commands_dir", path.parent)
-                executable = _text(step.get("executable", "clangd"), f"{field}.executable")
+                executable = _text(step.get("executable", "clangd" if step_type == "clangd_lsp" else "indexer-clang-ast"), f"{field}.executable")
                 if "\0" in executable:
                     raise ConfigurationError(f"{field}.executable: cannot contain a null character")
                 if "/" in executable:
                     executable = str(_path(executable, f"{field}.executable", path.parent))
-                timeout = step.get("timeout_seconds", 60)
+                timeout = step.get("timeout_seconds", 60 if step_type == "clangd_lsp" else 120)
                 if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
                         or not math.isfinite(timeout) or timeout <= 0):
                     raise ConfigurationError(f"{field}.timeout_seconds: expected a positive finite number")
@@ -138,7 +150,8 @@ def load_config(path: Path) -> PipelineConfig:
                 exclude = _strings(step.get("exclude_paths", []), f"{field}.exclude_paths")
                 if any(Path(pattern).is_absolute() for pattern in exclude):
                     raise ConfigurationError(f"{field}.exclude_paths: expected project-relative patterns")
-                steps.append(ClangdLspStepConfig(directory, executable, timeout, remove, exclude))
+                config_type = ClangdLspStepConfig if step_type == "clangd_lsp" else ClangAstStepConfig
+                steps.append(config_type(directory, executable, timeout, remove, exclude))
                 continue
             if step_type != "clangd_yaml":
                 raise ConfigurationError(f"{field}.type: unknown step type: {step_type}")

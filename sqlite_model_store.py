@@ -10,6 +10,7 @@ import stat
 
 from index_model import IndexModel, ModelValidationError, SCHEMA_VERSION, validate
 from model_store import ModelStore
+from progress import NO_PROGRESS, ProgressReporter
 
 
 logger = logging.getLogger(__name__)
@@ -29,8 +30,9 @@ def _insert(connection: sqlite3.Connection, table: str, columns: str, rows: Iter
 
 
 class SQLiteModelStore(ModelStore):
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, progress: ProgressReporter = NO_PROGRESS) -> None:
         self.path = Path(path).absolute()
+        self._progress = progress
         self._schema = Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
         with closing(sqlite3.connect(":memory:")) as reference:
             reference.executescript(self._schema)
@@ -62,7 +64,9 @@ class SQLiteModelStore(ModelStore):
             raise ValueError(f"Database metadata must identify the same project ({project_root}): {self.path}")
 
     def save(self, model: IndexModel) -> None:
-        logger.info("Saving model to %s", self.path)
+        if not self._progress.enabled:
+            logger.info("Saving model to %s", self.path)
+        self._progress.phase("validating database snapshot", detail=str(self.path))
         created_file = None
         try:
             if not isinstance(model, IndexModel):
@@ -70,6 +74,7 @@ class SQLiteModelStore(ModelStore):
             issues = validate(model)
             if issues:
                 raise ModelValidationError(issues)
+            self._progress.phase("opening database", detail=str(self.path))
             self.check_destination(model.metadata.project_root)
             try:
                 descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -86,6 +91,7 @@ class SQLiteModelStore(ModelStore):
                 connection.execute("PRAGMA foreign_keys = ON")
                 if created_file is not None:
                     connection.executescript(self._schema)
+                self._progress.phase("writing database", detail=str(self.path))
                 connection.execute("BEGIN IMMEDIATE")
                 try:
                     if created_file is None:
@@ -95,7 +101,9 @@ class SQLiteModelStore(ModelStore):
                         connection.execute(f"DELETE FROM {table}")
                     connection.execute("DELETE FROM sqlite_sequence")
                     self._write_model(connection, model)
+                    self._progress.phase("checking database integrity", detail=str(self.path))
                     self._check_integrity(connection)
+                    self._progress.phase("committing database", detail=str(self.path))
                     connection.commit()
                 except BaseException:
                     connection.rollback()

@@ -13,6 +13,7 @@ from index_model import (
     Position, ReferenceId, ReferenceKind, ScopeId, SnapshotStatus, SymbolId,
 )
 from index_pipeline import Step, SummaryItem
+from progress import NO_PROGRESS, ProgressReporter
 
 from .reader import ClangdYamlReader, IndexParseError
 from .records import (
@@ -46,8 +47,10 @@ _REFERENCE_KINDS = (
 
 
 class ClangdYamlStep(Step):
-    def __init__(self, reader: ClangdYamlReader, sources: LocalSourceReader) -> None:
+    def __init__(self, reader: ClangdYamlReader, sources: LocalSourceReader, *,
+                 progress: ProgressReporter = NO_PROGRESS) -> None:
         self._reader = reader
+        self._progress = progress
         self._sources = sources
         self._report: ImportReport | None = None
 
@@ -70,12 +73,19 @@ class ClangdYamlStep(Step):
 
     def run(self, model: IndexModel) -> IndexModel:
         self._report = None
+        self._progress.phase("preparing import")
         importer = _ClangdImport(model, self._sources, self._reader.path)
+        self._progress.phase("importing", total=self._reader.path.stat().st_size, unit="bytes")
+        completed = 0
         # Close the reader even when translation fails partway through iteration.
         with closing(self._reader.read()) as records:
             for record in records:
                 importer.add_record(record)
+                completed += len(record.source.raw_yaml)
+                self._progress.update(completed)
+        self._progress.phase("building and validating model")
         result = importer.build_model()
+        self._progress.phase("building report")
         report = importer.build_report()
         self._log_diagnostics(report)
         self._report = report
@@ -155,7 +165,7 @@ class _ClangdImport:
         else:
             raise TypeError(f"Unsupported export record: {type(payload).__name__}")
         if self._counts["documents"] % 5000 == 0:
-            logger.info("Imported %d YAML documents", self._counts["documents"])
+            logger.debug("Imported %d YAML documents", self._counts["documents"])
 
     def _ensure_symbol_id(self, external_id: str) -> SymbolId:
         if external_id not in self._symbol_ids:

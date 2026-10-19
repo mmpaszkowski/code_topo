@@ -7,14 +7,16 @@ import subprocess
 import sqlite3
 import sys
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from application import Application
 from application_factory import create_application
+from clangd_import import ClangdYamlStep
 from index_model import IndexBuilder, SnapshotStatus
 from index_pipeline import Step, SummaryItem
-from pipeline_config import ClangdYamlStepConfig, DatabaseConfig, PipelineConfig
+from pipeline_config import ClangdLspStepConfig, ClangdYamlStepConfig, DatabaseConfig, PipelineConfig
 from run_pipeline import print_summary
 from sqlite_model_store import SQLiteModelStore
 
@@ -38,6 +40,22 @@ class RecordStep(Step):
 
 
 class ApplicationFactoryTests(unittest.TestCase):
+    def test_lsp_identity_provider_reads_the_current_import_report(self):
+        config = PipelineConfig(Path("/example"), (
+            ClangdYamlStepConfig(Path("input.yaml")), ClangdLspStepConfig(Path("build")),
+        ))
+        importer = Mock(spec=ClangdYamlStep)
+        importer.report = None
+        with patch("application_factory.create_step", side_effect=[importer, RecordStep("lsp", [])]) as factory:
+            create_application(config)
+        provider = factory.call_args_list[1].kwargs["symbol_ids_provider"]
+        self.assertEqual(provider(), {})
+        for symbol_ids in ({"first": 1}, {"second": 2}):
+            importer.report = SimpleNamespace(symbol_ids=symbol_ids)
+            self.assertEqual(provider(), symbol_ids)
+        importer.report = None
+        self.assertEqual(provider(), {})
+
     def test_existing_destination_is_checked_before_constructing_steps(self):
         with TemporaryDirectory() as directory:
             database = Path(directory) / "unrelated.sqlite3"
@@ -57,7 +75,7 @@ class ApplicationFactoryTests(unittest.TestCase):
         with patch("application_factory.create_step", side_effect=steps) as factory:
             app = create_application(config)
         self.assertEqual([call.args[0] for call in factory.call_args_list], list(configs))
-        self.assertEqual(app.steps, steps)
+        self.assertEqual(app.steps[1:-1], steps)
 
 
 class ApplicationTests(unittest.TestCase):
@@ -171,14 +189,14 @@ Type: c:I
     def assert_success(self, result):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"Project: {self.source}", result.stdout)
-        self.assertIn("Snapshot status: building", result.stdout)
+        self.assertIn("Snapshot status: complete", result.stdout)
         self.assertIn("Files: 1", result.stdout)
         self.assertIn("Symbols: 1", result.stdout)
         self.assertIn("Locations: 1", result.stdout)
         self.assertIn("References: 0", result.stdout)
         self.assertIn("Source assumption:", result.stdout)
-        self.assertIn("Starting step 1/1: ClangdYamlStep", result.stderr)
-        self.assertIn("Completed step 1/1: ClangdYamlStep", result.stderr)
+        self.assertIn("Starting step 2/3: ClangdYamlStep", result.stderr)
+        self.assertIn("Completed step 2/3: ClangdYamlStep", result.stderr)
         self.assertNotIn("Starting step", result.stdout)
         self.assertNotIn("Traceback", result.stderr)
 
@@ -188,6 +206,20 @@ Type: c:I
         self.assert_success(result)
         self.assertIn("clangd_yaml diagnostics: 0", result.stdout)
         self.assertEqual(set(self.directory.rglob("*")), before)
+        self.assertIn(f"{self.export.stat().st_size}/{self.export.stat().st_size} bytes", result.stderr)
+        self.assertIn("total elapsed", result.stderr)
+        self.assertNotIn("remaining", result.stdout)
+
+    def test_progress_options_and_disabled_reporting(self):
+        result = self.run_cli('--no-progress', '--progress-interval', '0.1')
+        self.assert_success(result)
+        self.assertNotIn('remaining', result.stderr)
+        for value in ('0', '-1', 'nan', 'inf', 'bad'):
+            with self.subTest(value=value):
+                result = self.run_cli('--progress-interval', value)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn('positive finite number', result.stderr)
+                self.assertNotIn('Starting step', result.stderr)
 
     def test_explicit_config_resolves_paths_from_its_directory(self):
         result = self.run_cli("--config", "../settings/config.yaml", cwd=self.caller)
@@ -204,10 +236,10 @@ Type: c:I
             self.assert_success(result)
             self.assertIn(f"Database: {database}", result.stdout)
             self.assertIn("Saved model to", result.stderr)
-            self.assertLess(result.stderr.index("Saved model to"), result.stderr.index("Completed step"))
+            self.assertLess(result.stderr.index("Saved model to"), result.stderr.index("Completed step 2/3: ClangdYamlStep"))
             with closing(sqlite3.connect(database)) as connection:
                 self.assertEqual(connection.execute("SELECT name FROM symbols").fetchall(), [(name,)])
-                self.assertEqual(connection.execute("SELECT status FROM index_metadata").fetchall(), [("building",)])
+                self.assertEqual(connection.execute("SELECT status FROM index_metadata").fetchall(), [("complete",)])
                 self.assertEqual(connection.execute("PRAGMA integrity_check").fetchall(), [("ok",)])
                 self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
 
@@ -239,14 +271,14 @@ Type: c:I
         self.assertIn(f"{self.export}:", result.stderr)
         self.assertIn("SymInfo.Kind", result.stderr)
         self.assertEqual(result.stderr.count("SymInfo.Kind"), 1)
-        self.assertLess(result.stderr.index("SymInfo.Kind"), result.stderr.index("Completed step"))
+        self.assertLess(result.stderr.index("SymInfo.Kind"), result.stderr.index("Completed step 2/3: ClangdYamlStep"))
 
         with self.config.open("a", encoding="utf-8") as stream:
             stream.write("    recover_known_errors: false\n")
         result = self.run_cli()
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(result.stdout, "")
-        self.assertIn("Failed step 1/1", result.stderr)
+        self.assertIn("Failed step 2/3: ClangdYamlStep", result.stderr)
 
     def test_config_errors_fail_before_import(self):
         self.export.unlink()
@@ -272,7 +304,7 @@ Type: c:I
         result = self.run_cli()
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout, "")
-        self.assertIn("Failed step 1/1", result.stderr)
+        self.assertIn("Failed step 1/3", result.stderr)
         self.assertIn(str(self.export), result.stderr)
 
     def test_help_does_not_require_configuration(self):

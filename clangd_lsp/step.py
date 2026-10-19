@@ -1,33 +1,48 @@
 """Add ranges and includes without discovering symbols or depending on YAML."""
 
 from collections import Counter, defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from fnmatch import fnmatchcase
 from hashlib import sha256
 import logging
 from pathlib import Path
+from time import monotonic
 
 from index_model import (
     CollectionStage, CollectionState, File, FileId, IncludeId, IndexBuilder,
     IndexModel, Location, LocationId, Position, ReferenceKind, SnapshotStatus, SourceRangeRole, SymbolId,
 )
 from index_pipeline import Step, SummaryItem
+from progress import NO_PROGRESS, ProgressReporter
 
 from .client import ClangdClient
-from .records import CompilerDiagnostic, Diagnostic, DiagnosticReason, EnrichmentReport, SourceRange
+from .records import (
+    CompilerDiagnostic, Diagnostic, DiagnosticReason, EnrichmentReport, LspPosition,
+    SourceRange, SymbolInfo,
+)
 from .source import SourceText, local_path
+from .static_index import StaticIndexSource
+from .structural import StructuralEnrichment
 from .transport import LspRequestError
 
 
 logger = logging.getLogger(__name__)
 _STAGES = (CollectionStage.SOURCE_RANGES, CollectionStage.INCLUDES)
+SymbolIdsProvider = Callable[[], Mapping[str, SymbolId]]
+IndexSourceProvider = Callable[[], StaticIndexSource]
 
 
 class ClangdLspStep(Step):
-    def __init__(self, client: ClangdClient, *, exclude_paths: Sequence[str] = ()):
+    def __init__(self, client: ClangdClient, *, exclude_paths: Sequence[str] = (),
+                 symbol_ids_provider: SymbolIdsProvider | None = None,
+                 index_source_provider: IndexSourceProvider | None = None,
+                 progress: ProgressReporter = NO_PROGRESS):
+        self._progress = progress
         self._client = client
         self._exclude_paths = tuple(exclude_paths)
+        self._symbol_ids_provider = symbol_ids_provider
+        self._index_source_provider = index_source_provider
         self._report: EnrichmentReport | None = None
 
     @property
@@ -39,25 +54,50 @@ class ClangdLspStep(Step):
             return ()
         report = self._report
         reasons = Counter(d.reason for d in report.diagnostics)
-        return (
+        items = (
             SummaryItem("LSP files processed", report.files_processed),
             SummaryItem("LSP files skipped", report.files_skipped),
             SummaryItem("LSP files excluded", report.files_excluded),
             SummaryItem("LSP source ranges added", report.ranges_added),
             SummaryItem("LSP includes added", report.includes_added),
             SummaryItem("LSP occurrences matched", f"{report.occurrences_matched}/{report.occurrences_total}"),
+            SummaryItem("LSP occurrences resolved by identity", report.occurrences_identity_resolved),
             SummaryItem("clangd_lsp diagnostics", len(report.diagnostics)),
         ) + tuple(SummaryItem(f"LSP {reason.value}", count) for reason, count in sorted(reasons.items()))
+        if report.structural is not None:
+            from dataclasses import fields
+            items += tuple(SummaryItem("LSP " + field.name.replace("_", " "), getattr(report.structural, field.name))
+                           for field in fields(report.structural))
+            items += (SummaryItem("LSP normalized index records", report.normalized_index_records),
+                      SummaryItem("LSP call classification", "deferred: hierarchy also reports non-call references"),
+                      SummaryItem("LSP elapsed seconds", f"{report.elapsed_seconds:.2f}"))
+        return items
 
     def run(self, model: IndexModel) -> IndexModel:
         self._report = None
-        work = _Enrichment(model, self._client, self._exclude_paths)
+        self._progress.phase("setting up LSP enrichment")
+        started = monotonic()
+        symbol_ids = self._symbol_ids_provider() if self._symbol_ids_provider is not None else {}
+        work = _Enrichment(model, self._client, self._exclude_paths, symbol_ids, progress=self._progress)
+        index_source = self._index_source_provider() if self._index_source_provider is not None else None
+        if index_source is not None:
+            work.structural = StructuralEnrichment(work)
         try:
-            self._client.start(Path(model.metadata.project_root).resolve())
+            self._progress.phase("starting clangd")
+            root = Path(model.metadata.project_root).resolve()
+            if index_source is None:
+                self._client.start(root)
+            else:
+                self._client.start(root, index_source=index_source)
+                self._progress.phase("verifying static index")
+                work.structural.verify_index()
             result = work.run()
+            normalized = self._client.normalized_index_records if index_source is not None else 0
         finally:
+            self._progress.phase("shutting down clangd")
             self._client.close()
-        report = work.report()
+        self._progress.phase("building report")
+        report = replace(work.report(), normalized_index_records=normalized, elapsed_seconds=monotonic() - started)
         for diagnostic in report.diagnostics:
             stage = diagnostic.stage.value if diagnostic.stage else "file"
             where = diagnostic.uri
@@ -73,10 +113,27 @@ class ClangdLspStep(Step):
 class _Enrichment:
     """Mutable staging state for one run; discarded if the session fails."""
 
-    def __init__(self, model: IndexModel, client: ClangdClient, exclude_paths: tuple[str, ...]):
+    def __init__(self, model: IndexModel, client: ClangdClient, exclude_paths: tuple[str, ...],
+                 symbol_ids: Mapping[str, SymbolId], *, progress: ProgressReporter = NO_PROGRESS):
         self.model = model
+        self.progress = progress
+        self.root = Path(model.metadata.project_root).resolve()
         self.client = client
         self.exclude_paths = exclude_paths
+        # This mapping belongs to this run, not to the model or generic pipeline.
+        self.symbol_ids = {}
+        known_ids = {symbol.symbol_id for symbol in model.symbols}
+        if not isinstance(symbol_ids, Mapping):
+            raise ValueError("symbol_ids_provider must return a mapping")
+        for external, local in symbol_ids.items():
+            if not isinstance(external, str) or not external:
+                raise ValueError("Expected a nonempty clangd symbol ID")
+            if type(local) is not int or local not in known_ids:
+                raise ValueError(f"Mapped symbol ID {local!r} is not in the input model")
+            external = external.upper()
+            if external in self.symbol_ids and self.symbol_ids[external] != local:
+                raise ValueError(f"Conflicting mapping for clangd symbol ID {external}")
+            self.symbol_ids[external] = local
         self.builder = IndexBuilder.from_model(model)
         self.builder.update_metadata(replace(model.metadata, status=SnapshotStatus.BUILDING,
                                              completed_at=None, error=None))
@@ -106,12 +163,26 @@ class _Enrichment:
         self.diagnostics = []
         self.files_processed = self.files_skipped = self.ranges_added = self.includes_added = 0
         self.files_excluded = self.occurrences_matched = self.occurrences_total = 0
+        self.occurrences_identity_resolved = 0
+        self.structural = None
+
+    def selected(self, file: File) -> bool:
+        try:
+            return self.path_selected(local_path(file.uri))
+        except (OSError, ValueError):
+            return False
+
+    def path_selected(self, path: Path) -> bool:
+        return path.is_relative_to(self.root) and not any(
+            fnmatchcase(path.relative_to(self.root).as_posix(), pattern) for pattern in self.exclude_paths)
 
     def _occurrence(self, symbol_id: SymbolId, location: Location, role: SourceRangeRole) -> None:
         self.occurrences[location.file.file_id][location.start, location.end].add((symbol_id, role))
 
     def run(self) -> IndexModel:
         root = Path(self.model.metadata.project_root).resolve()
+        self.progress.phase("selecting project files")
+        selected = []
         for file in sorted(self.model.files, key=lambda f: f.uri):
             try:
                 path = local_path(file.uri)
@@ -122,15 +193,24 @@ class _Enrichment:
                 relative = path.relative_to(root).as_posix()
                 if any(fnmatchcase(relative, pattern) for pattern in self.exclude_paths):
                     self.files_excluded += 1
-                    logger.info("LSP excluded %s", relative)
+                    logger.debug("LSP excluded %s", relative)
                     continue
-                self.occurrences_total += sum(len(matches) for matches in self.occurrences[file.file_id].values())
-                self._file(file, path)
-        return self.builder.build()
+                selected.append((file, path))
+        self.progress.phase("inspecting", total=len(selected), unit="files")
+        for number, (file, path) in enumerate(selected, 1):
+            self.progress.update(detail=str(path))
+            self.occurrences_total += sum(len(matches) for matches in self.occurrences[file.file_id].values())
+            self._file(file, path)
+            self.progress.update(number)
+        self.progress.phase("finalizing model")
+        if self.structural is not None:
+            self.structural.finish_statuses()
+        result = self.builder.build()
+        return self.structural.finish_references(result) if self.structural is not None else result
 
     def _file(self, file: File, path: Path) -> None:
         uri = path.as_uri()
-        logger.info("LSP inspecting %s", path)
+        logger.debug("LSP inspecting %s", path)
         try:
             if len(self.files[uri]) != 1:
                 raise ValueError("Multiple model files resolve to this URI")
@@ -143,9 +223,13 @@ class _Enrichment:
             for stage in _STAGES:
                 self._status(file, stage, [Diagnostic(file.uri, stage, str(error),
                                                       DiagnosticReason.SOURCE_FAILURE)], failed=True)
+            if self.structural is not None:
+                self.structural.failed_file(file, str(error))
             return
 
         parse_errors = self.client.open_document(uri, source.text)
+        if self.structural is not None:
+            self.structural.process_file(file, uri, source, parse_errors)
         self._ranges(file, uri, source, parse_errors)
         self._includes(file, uri, source, parse_errors)
         # Fatal errors skip this notification; run() closes the failed session.
@@ -156,15 +240,19 @@ class _Enrichment:
                 parse_errors: tuple[CompilerDiagnostic, ...]) -> None:
         stage = CollectionStage.SOURCE_RANGES
         try:
-            symbols = self.client.document_symbols(uri)
+            result = self.client.document_symbols(uri)
         except (LspRequestError, ValueError) as error:
             self._request_failure(file, stage, error)
             return
         errors = self._compiler_errors(file, stage, source, parse_errors)
+        errors.extend(Diagnostic(file.uri, stage, f"{issue.path}: {issue.message}", DiagnosticReason.DECODE_ERROR)
+                      for issue in result.issues)
         expected = self.occurrences[file.file_id]
         matched = set()
+        identity_matched = set()
+        identity_cache = {}
         rejected = {}
-        pending = list(reversed(symbols))
+        pending = list(reversed(result.items))
         while pending:
             symbol = pending.pop()
             pending.extend(reversed(symbol.children))
@@ -189,9 +277,14 @@ class _Enrichment:
                                          DiagnosticReason.UNMATCHED_OUTLINE, source_range=SourceRange(*selection)))
                 continue
             if len(candidates) > 1:
+                chosen, detail = self._identity_match(uri, symbol.selection.start, candidates, identity_cache)
                 rejected[selection] = (DiagnosticReason.AMBIGUOUS_MATCH,
-                                       f"multiple candidate symbol IDs: {', '.join(map(str, candidates))}", candidates)
-                continue
+                                       f"multiple candidate symbol IDs: {', '.join(map(str, candidates))}; {detail}",
+                                       candidates)
+                if chosen is None:
+                    continue
+                matches = {(symbol_id, role) for symbol_id, role in matches if symbol_id == chosen}
+                identity_matched.update((selection, symbol_id, role) for symbol_id, role in matches)
             location_id = self._location(file.file_id, *extent)
             for symbol_id, role in sorted(matches):
                 key = (symbol_id, location_id, role)
@@ -201,6 +294,7 @@ class _Enrichment:
                     self.ranges_added += 1
                 matched.add((selection, symbol_id, role))
         self.occurrences_matched += len(matched)
+        self.occurrences_identity_resolved += len(identity_matched)
         for selection, matches in sorted(expected.items()):
             for symbol_id, role in sorted(matches):
                 if (selection, symbol_id, role) in matched:
@@ -213,16 +307,41 @@ class _Enrichment:
                                          SourceRange(*selection), candidates))
         self._status(file, stage, errors)
 
+    def _identity_match(self, uri: str, position: LspPosition, candidates: tuple[SymbolId, ...],
+                        cache: dict[LspPosition, tuple[SymbolInfo, ...] | LspRequestError | ValueError]
+                        ) -> tuple[SymbolId | None, str]:
+        if not self.symbol_ids:
+            return None, "no imported identity mapping available"
+        if position not in cache:
+            try:
+                cache[position] = self.client.symbol_info(uri, position)
+            except (LspRequestError, ValueError) as error:
+                cache[position] = error
+        result = cache[position]
+        if isinstance(result, (LspRequestError, ValueError)):
+            return None, f"symbolInfo lookup failed: {result}"
+        if not result or any(info.id is None for info in result):
+            return None, "symbolInfo returned no usable identity"
+        identifiers = {self.symbol_ids.get(info.id.upper()) for info in result}
+        if None in identifiers:
+            return None, "symbolInfo returned an unmapped identity"
+        if len(identifiers) != 1 or not identifiers.issubset(candidates):
+            return None, "symbolInfo identities do not identify exactly one candidate"
+        chosen = next(iter(identifiers))
+        return chosen, f"symbolInfo identified symbol {chosen}; other candidates remain unresolved"
+
     def _includes(self, file: File, uri: str, source: SourceText,
                   parse_errors: tuple[CompilerDiagnostic, ...]) -> None:
         stage = CollectionStage.INCLUDES
         try:
-            links = self.client.document_links(uri)
+            result = self.client.document_links(uri)
         except (LspRequestError, ValueError) as error:
             self._request_failure(file, stage, error)
             return
         errors = self._compiler_errors(file, stage, source, parse_errors)
-        for link in links:
+        errors.extend(Diagnostic(file.uri, stage, f"{issue.path}: {issue.message}", DiagnosticReason.DECODE_ERROR)
+                      for issue in result.issues)
+        for link in result.items:
             try:
                 extent = SourceRange(*source.range(link.extent, self.client.position_encoding))
             except ValueError as error:
@@ -298,4 +417,6 @@ class _Enrichment:
     def report(self) -> EnrichmentReport:
         return EnrichmentReport(self.files_processed, self.files_skipped, self.files_excluded,
                                 self.ranges_added, self.includes_added, self.occurrences_matched,
-                                self.occurrences_total, tuple(self.diagnostics))
+                                self.occurrences_total, tuple(dict.fromkeys(self.diagnostics)),
+                                self.occurrences_identity_resolved,
+                                self.structural.report() if self.structural is not None else None)
